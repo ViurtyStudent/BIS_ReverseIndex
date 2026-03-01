@@ -3,6 +3,7 @@ package index
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -24,7 +25,10 @@ type LSMIndex struct {
 	docStorePath  string
 	memByteSize   int
 	maxMemSize    int
+	postingSeq    uint64
 }
+
+const postingKeySeparator = "\x1f"
 
 func NewLSMIndex(baseDir string, language string, sizeRatio int) (*LSMIndex, error) {
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
@@ -50,6 +54,7 @@ func NewLSMIndex(baseDir string, language string, sizeRatio int) (*LSMIndex, err
 		docStorePath:  filepath.Join(baseDir, "documents.json"),
 		memByteSize:   0,
 		maxMemSize:    10 * 1024 * 1024,
+		postingSeq:    1,
 	}
 
 	idx.loadDocuments()
@@ -103,16 +108,23 @@ func (idx *LSMIndex) AddDocument(externalID string, title, content string) (uint
 }
 
 func (idx *LSMIndex) flushMemTermsLocked() error {
+	if idx.postingSeq == 0 {
+		idx.postingSeq = 1
+	}
+
 	for term, bitmap := range idx.memTerms {
 		data, err := bitmap.Serialize()
 		if err != nil {
 			return err
 		}
 		encoded := base64.StdEncoding.EncodeToString(data)
-		if err := idx.tree.Insert(term, encoded); err != nil {
+		key := idx.makePostingKey(term, idx.postingSeq)
+		if err := idx.tree.Insert(key, encoded); err != nil {
 			return err
 		}
 	}
+
+	idx.postingSeq++
 
 	idx.memTerms = make(map[string]*Bitmap)
 	idx.memByteSize = 0
@@ -189,20 +201,46 @@ func (idx *LSMIndex) getTermBitmapLocked(term string) *Bitmap {
 		result = result.Or(memBitmap)
 	}
 
-	value, found, err := idx.tree.Get(term)
-	if err == nil && found && value != "" {
-		data, err := base64.StdEncoding.DecodeString(value)
-		if err == nil {
-			diskBitmap, err := Deserialize(data)
-			if err == nil {
-				result = result.Or(diskBitmap)
+	if value, found, err := idx.tree.Get(term); err == nil && found && value != "" {
+		result = idx.mergeEncodedBitmap(result, value)
+	}
+
+	fromKey, toKey := idx.postingRange(term)
+	if records, err := idx.tree.RangeScan(fromKey, toKey); err == nil {
+		for _, record := range records {
+			if record.Value == "" {
+				continue
 			}
+			result = idx.mergeEncodedBitmap(result, record.Value)
 		}
 	}
 
 	result = result.And(idx.universe)
 
 	return result
+}
+
+func (idx *LSMIndex) mergeEncodedBitmap(base *Bitmap, encoded string) *Bitmap {
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return base
+	}
+
+	diskBitmap, err := Deserialize(data)
+	if err != nil {
+		return base
+	}
+
+	return base.Or(diskBitmap)
+}
+
+func (idx *LSMIndex) makePostingKey(term string, seq uint64) string {
+	return fmt.Sprintf("%s%s%020d", term, postingKeySeparator, seq)
+}
+
+func (idx *LSMIndex) postingRange(term string) (string, string) {
+	prefix := term + postingKeySeparator
+	return prefix, prefix + "\xff"
 }
 
 func (idx *LSMIndex) GetTermBitmap(term string) *Bitmap {
@@ -234,11 +272,13 @@ func (idx *LSMIndex) saveDocumentsLocked() error {
 		DocIDMap      map[string]uint32    `json:"doc_id_map"`
 		ReverseDocMap map[uint32]string    `json:"reverse_doc_map"`
 		Universe      []byte               `json:"universe"`
+		PostingSeq    uint64               `json:"posting_seq"`
 	}{
 		Documents:     idx.documents,
 		NextDocID:     idx.nextDocID,
 		DocIDMap:      idx.docIDMap,
 		ReverseDocMap: idx.reverseDocMap,
+		PostingSeq:    idx.postingSeq,
 	}
 
 	universeData, err := idx.universe.Serialize()
@@ -270,6 +310,7 @@ func (idx *LSMIndex) loadDocuments() error {
 		DocIDMap      map[string]uint32    `json:"doc_id_map"`
 		ReverseDocMap map[uint32]string    `json:"reverse_doc_map"`
 		Universe      []byte               `json:"universe"`
+		PostingSeq    uint64               `json:"posting_seq"`
 	}
 
 	if err := json.Unmarshal(data, &stored); err != nil {
@@ -280,6 +321,23 @@ func (idx *LSMIndex) loadDocuments() error {
 	idx.nextDocID = stored.NextDocID
 	idx.docIDMap = stored.DocIDMap
 	idx.reverseDocMap = stored.ReverseDocMap
+	idx.postingSeq = stored.PostingSeq
+
+	if idx.documents == nil {
+		idx.documents = make(map[uint32]*Document)
+	}
+	if idx.docIDMap == nil {
+		idx.docIDMap = make(map[string]uint32)
+	}
+	if idx.reverseDocMap == nil {
+		idx.reverseDocMap = make(map[uint32]string)
+	}
+	if idx.nextDocID == 0 {
+		idx.nextDocID = 1
+	}
+	if idx.postingSeq == 0 {
+		idx.postingSeq = 1
+	}
 
 	if len(stored.Universe) > 0 {
 		universe, err := Deserialize(stored.Universe)
