@@ -1,6 +1,7 @@
 package index
 
 import (
+	"strings"
 	"sync"
 )
 
@@ -13,6 +14,9 @@ type Document struct {
 type InvertedIndex struct {
 	mu            sync.RWMutex
 	terms         map[string]*Bitmap
+	kGramIndex    map[string]map[string]struct{}
+	termSet       map[string]struct{}
+	kGramSize     int
 	documents     map[uint32]*Document
 	processor     *TextProcessor
 	universe      *Bitmap
@@ -24,6 +28,9 @@ type InvertedIndex struct {
 func NewInvertedIndex(language string) *InvertedIndex {
 	return &InvertedIndex{
 		terms:         make(map[string]*Bitmap),
+		kGramIndex:    make(map[string]map[string]struct{}),
+		termSet:       make(map[string]struct{}),
+		kGramSize:     defaultKGramSize,
 		documents:     make(map[uint32]*Document),
 		processor:     NewTextProcessor(language),
 		universe:      NewBitmap(),
@@ -60,6 +67,8 @@ func (idx *InvertedIndex) AddDocument(externalID string, title, content string) 
 	for _, term := range terms {
 		if _, ok := idx.terms[term]; !ok {
 			idx.terms[term] = NewBitmap()
+			idx.termSet[term] = struct{}{}
+			idx.addTermToKGramIndexLocked(term)
 		}
 		idx.terms[term].Add(docID)
 	}
@@ -88,6 +97,8 @@ func (idx *InvertedIndex) removeDocumentLocked(docID uint32) {
 	for term, bitmap := range idx.terms {
 		bitmap.Remove(docID)
 		if bitmap.IsEmpty() {
+			idx.removeTermFromKGramIndexLocked(term)
+			delete(idx.termSet, term)
 			delete(idx.terms, term)
 		}
 	}
@@ -134,6 +145,110 @@ func (idx *InvertedIndex) GetTermBitmap(term string) *Bitmap {
 		return bitmap.Clone()
 	}
 	return NewBitmap()
+}
+
+func (idx *InvertedIndex) SearchPrefix(prefix string) *Bitmap {
+	processedPrefix := idx.processor.ProcessQuery(prefix)
+	if processedPrefix == "" {
+		return NewBitmap()
+	}
+
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	result := NewBitmap()
+	for term, bitmap := range idx.terms {
+		if strings.HasPrefix(term, processedPrefix) {
+			result = result.Or(bitmap)
+		}
+	}
+
+	return result
+}
+
+func (idx *InvertedIndex) SearchWildcard(pattern string) *Bitmap {
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	if pattern == "" {
+		return NewBitmap()
+	}
+
+	if !strings.Contains(pattern, "*") {
+		return idx.SearchTerm(pattern)
+	}
+
+	re, err := wildcardToRegexp(pattern)
+	if err != nil {
+		return NewBitmap()
+	}
+
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	queryKGrams := buildPatternKGrams(pattern, idx.kGramSize)
+
+	candidates := make(map[string]struct{})
+	if len(queryKGrams) == 0 {
+		for term := range idx.termSet {
+			candidates[term] = struct{}{}
+		}
+	} else {
+		initialized := false
+		for _, gram := range queryKGrams {
+			termsForGram, ok := idx.kGramIndex[gram]
+			if !ok {
+				return NewBitmap()
+			}
+
+			if !initialized {
+				for term := range termsForGram {
+					candidates[term] = struct{}{}
+				}
+				initialized = true
+				continue
+			}
+
+			for term := range candidates {
+				if _, ok := termsForGram[term]; !ok {
+					delete(candidates, term)
+				}
+			}
+
+			if len(candidates) == 0 {
+				return NewBitmap()
+			}
+		}
+	}
+
+	result := NewBitmap()
+	for term := range candidates {
+		if re.MatchString(term) {
+			if bitmap, ok := idx.terms[term]; ok {
+				result = result.Or(bitmap)
+			}
+		}
+	}
+
+	return result
+}
+
+func (idx *InvertedIndex) addTermToKGramIndexLocked(term string) {
+	for _, gram := range buildTermKGrams(term, idx.kGramSize) {
+		if _, ok := idx.kGramIndex[gram]; !ok {
+			idx.kGramIndex[gram] = make(map[string]struct{})
+		}
+		idx.kGramIndex[gram][term] = struct{}{}
+	}
+}
+
+func (idx *InvertedIndex) removeTermFromKGramIndexLocked(term string) {
+	for _, gram := range buildTermKGrams(term, idx.kGramSize) {
+		if termsForGram, ok := idx.kGramIndex[gram]; ok {
+			delete(termsForGram, term)
+			if len(termsForGram) == 0 {
+				delete(idx.kGramIndex, gram)
+			}
+		}
+	}
 }
 
 func (idx *InvertedIndex) GetUniverse() *Bitmap {

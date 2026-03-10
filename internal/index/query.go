@@ -23,6 +23,30 @@ func (q *TermQuery) String() string {
 	return q.Term
 }
 
+type PrefixQuery struct {
+	Prefix string
+}
+
+func (q *PrefixQuery) Evaluate(idx *InvertedIndex) *Bitmap {
+	return idx.SearchPrefix(q.Prefix)
+}
+
+func (q *PrefixQuery) String() string {
+	return q.Prefix + "*"
+}
+
+type WildcardQuery struct {
+	Pattern string
+}
+
+func (q *WildcardQuery) Evaluate(idx *InvertedIndex) *Bitmap {
+	return idx.SearchWildcard(q.Pattern)
+}
+
+func (q *WildcardQuery) String() string {
+	return q.Pattern
+}
+
 type AndQuery struct {
 	Left  Query
 	Right Query
@@ -195,6 +219,14 @@ func (p *QueryParser) parsePrimary() (Query, error) {
 	}
 
 	p.pos++
+
+	if strings.Contains(token, "*") {
+		if strings.Count(token, "*") == 1 && strings.HasSuffix(token, "*") && len(token) > 1 {
+			return &PrefixQuery{Prefix: token[:len(token)-1]}, nil
+		}
+		return &WildcardQuery{Pattern: token}, nil
+	}
+
 	return &TermQuery{Term: token}, nil
 }
 

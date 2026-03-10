@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"ViurtyStudent/internal/lsm"
@@ -249,6 +250,126 @@ func (idx *LSMIndex) GetTermBitmap(term string) *Bitmap {
 	return idx.getTermBitmapLocked(term)
 }
 
+func (idx *LSMIndex) SearchPrefix(prefix string) *Bitmap {
+	processedPrefix := idx.processor.ProcessQuery(prefix)
+	if processedPrefix == "" {
+		return NewBitmap()
+	}
+
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	terms := idx.collectAllTermsLocked()
+	result := NewBitmap()
+
+	for term := range terms {
+		if strings.HasPrefix(term, processedPrefix) {
+			result = result.Or(idx.getTermBitmapLocked(term))
+		}
+	}
+
+	return result
+}
+
+func (idx *LSMIndex) SearchWildcard(pattern string) *Bitmap {
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	if pattern == "" {
+		return NewBitmap()
+	}
+
+	if !strings.Contains(pattern, "*") {
+		return idx.SearchTerm(pattern)
+	}
+
+	re, err := wildcardToRegexp(pattern)
+	if err != nil {
+		return NewBitmap()
+	}
+
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	terms := idx.collectAllTermsLocked()
+	kGramIndex := make(map[string]map[string]struct{})
+	for term := range terms {
+		for _, gram := range buildTermKGrams(term, defaultKGramSize) {
+			if _, ok := kGramIndex[gram]; !ok {
+				kGramIndex[gram] = make(map[string]struct{})
+			}
+			kGramIndex[gram][term] = struct{}{}
+		}
+	}
+
+	queryKGrams := buildPatternKGrams(pattern, defaultKGramSize)
+	candidates := make(map[string]struct{})
+
+	if len(queryKGrams) == 0 {
+		for term := range terms {
+			candidates[term] = struct{}{}
+		}
+	} else {
+		initialized := false
+		for _, gram := range queryKGrams {
+			termsForGram, ok := kGramIndex[gram]
+			if !ok {
+				return NewBitmap()
+			}
+
+			if !initialized {
+				for term := range termsForGram {
+					candidates[term] = struct{}{}
+				}
+				initialized = true
+				continue
+			}
+
+			for term := range candidates {
+				if _, ok := termsForGram[term]; !ok {
+					delete(candidates, term)
+				}
+			}
+
+			if len(candidates) == 0 {
+				return NewBitmap()
+			}
+		}
+	}
+
+	result := NewBitmap()
+	for term := range candidates {
+		if re.MatchString(term) {
+			result = result.Or(idx.getTermBitmapLocked(term))
+		}
+	}
+
+	return result
+}
+
+func (idx *LSMIndex) collectAllTermsLocked() map[string]struct{} {
+	terms := make(map[string]struct{})
+
+	for term := range idx.memTerms {
+		terms[term] = struct{}{}
+	}
+
+	records, err := idx.tree.RangeScan("", "\xff")
+	if err != nil {
+		return terms
+	}
+
+	for _, record := range records {
+		term := record.Key
+		if sep := strings.Index(term, postingKeySeparator); sep >= 0 {
+			term = term[:sep]
+		}
+		if term != "" {
+			terms[term] = struct{}{}
+		}
+	}
+
+	return terms
+}
+
 func (idx *LSMIndex) GetUniverse() *Bitmap {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
@@ -382,6 +503,10 @@ func evaluateQueryOnAdapter(q Query, adapter *lsmIndexAdapter) *Bitmap {
 	switch v := q.(type) {
 	case *TermQuery:
 		return adapter.idx.SearchTerm(v.Term)
+	case *PrefixQuery:
+		return adapter.idx.SearchPrefix(v.Prefix)
+	case *WildcardQuery:
+		return adapter.idx.SearchWildcard(v.Pattern)
 	case *AndQuery:
 		left := evaluateQueryOnAdapter(v.Left, adapter)
 		right := evaluateQueryOnAdapter(v.Right, adapter)
